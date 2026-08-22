@@ -443,3 +443,11 @@
       name: '@deepseek-ai/dsh-agent-presets'
       config:
         default: standard
+
+# ── agent-browser (community plugin) ─────────────────────────────────────────
+# Headed browser + toolbar feedback card + launch settings. The host half is a
+# per-session agent-preset row (see contrib/agent-browser); this row loads the
+# web client surface into the GUI.
+- insert:
+    - id: ui-agent-browser
+      name: '@deepseek-ai/dsh-client-ui-agent-browser'

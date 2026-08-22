@@ -1,0 +1,31 @@
+{
+  "name": "@deepseek-ai/dsh-agent-browser",
+  "version": "0.1.0",
+  "description": "Headed Chrome preview with an injected toolbar (Pick/Draw/viewport) plus agent tools and a local feedback endpoint for the client bridge",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/types/**/*.d.ts",
+    "assets/toolbar.js"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "workspace:^",
+    "puppeteer-core": "^25.8.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "workspace:^",
+    "@deepseek-ai/dsh-tools": "workspace:^",
+    "@deepseek-ai/dsh-session": "workspace:^"
+  }
+}

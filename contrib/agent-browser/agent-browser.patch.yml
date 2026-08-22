@@ -1,0 +1,8 @@
+# Appended to a preset's agent.cordis.yml by contrib/agent-browser/install.sh.
+# Host half: headed Chrome + injected toolbar + feedback endpoint + launch
+# settings. The web client surface is loaded by the bundle roster row in
+# packages/bundle/web-app/cordis.patch.yml.
+- id: agent-browser
+  name: '@deepseek-ai/dsh-agent-browser'
+  config:
+    defaultUrl: http://localhost:4000/todos

@@ -1,0 +1,3 @@
+name: Agent Browser
+description: Standard coding agent plus the headed browser plugin (pick/draw, feedback card, launch settings, dev-server auto-start).
+order: 10
