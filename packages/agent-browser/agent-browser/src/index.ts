@@ -305,13 +305,19 @@ export function apply(ctx: Context, config: Config = {}): void {
           return { ok: true, url: state.page ? state.page.url() : null, viewport: state.page ? state.page.viewport() : null }
         case 'setViewport': {
           if (!state.page) return { ok: false, error: 'browser not launched' }
+          // Responsive: clear the fixed device-metrics override so the page's
+          // layout viewport tracks the actual browser window size.
+          if (payload.responsive === true) {
+            await state.page.setViewport(null)
+            return { ok: true, responsive: true }
+          }
           const width = Number(payload.width) || state.launchSettings.viewport.width
           const height = Number(payload.height) || state.launchSettings.viewport.height
           await state.page.setViewport({ width, height })
           await resizeWindow(state.page, width, height)
           state.launchSettings.viewport = { width, height }
           saveLaunchSettings(state)
-          return { ok: true, viewport: state.page.viewport() }
+          return { ok: true, responsive: false, viewport: state.page.viewport() }
         }
         case 'setWindowSize': {
           if (!state.page) return { ok: false, error: 'browser not launched' }
@@ -442,7 +448,14 @@ export function apply(ctx: Context, config: Config = {}): void {
       ...(chromePath ? { executablePath: chromePath } : {}),
     })
     state.page = await state.browser.newPage()
-    await state.page.setViewport({ width: viewportWidth, height: viewportHeight })
+    // Responsive by default when no explicit size was requested: keep the
+    // layout viewport tracking the actual browser window (setViewport(null));
+    // a fixed preset or explicit width/height applies a pixel viewport.
+    if (width !== undefined || height !== undefined) {
+      await state.page.setViewport({ width: viewportWidth, height: viewportHeight })
+    } else {
+      await state.page.setViewport(null)
+    }
     await state.page.exposeFunction('__agentBridge', (cmd: string, payload: Record<string, unknown>) =>
       handleBridge(state, cmd, payload))
     await state.page.evaluateOnNewDocument(toolbarSource)

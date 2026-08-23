@@ -88,6 +88,7 @@
     vpLbl.textContent = 'Viewport'
     const presets = document.createElement('select')
     const P = [
+      ['Responsive', 'responsive'],
       ['Desktop', 1280, 800],
       ['Tablet P', 768, 1024],
       ['Tablet L', 1024, 768],
@@ -96,10 +97,11 @@
     ]
     P.forEach(function (p) {
       const o = document.createElement('option')
-      o.value = p[1] + 'x' + p[2]
-      o.textContent = p[0] + ' ' + p[1] + '\u00D7' + p[2]
+      o.value = p.length === 2 ? p[1] : p[1] + 'x' + p[2]
+      o.textContent = p[0] + (p.length === 2 ? '' : ' ' + p[1] + '\u00D7' + p[2])
       presets.appendChild(o)
     })
+    presets.value = 'responsive'
     const rot = document.createElement('button')
     rot.textContent = '\u21BB'
     rot.title = 'Rotate (swap width/height)'
@@ -245,8 +247,12 @@
 
     // ---- viewport ----
     presets.addEventListener('change', async function () {
-      const wh = presets.value.split('x').map(Number)
-      await window.__agentBridge('setViewport', { width: wh[0], height: wh[1] })
+      if (presets.value === 'responsive') {
+        await window.__agentBridge('setViewport', { responsive: true })
+      } else {
+        const wh = presets.value.split('x').map(Number)
+        await window.__agentBridge('setViewport', { width: wh[0], height: wh[1] })
+      }
       updateDims()
     })
     rot.addEventListener('click', async function () {
