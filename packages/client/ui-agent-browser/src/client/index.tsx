@@ -1,29 +1,28 @@
 /**
  * Client half of the agent-browser plugin.
  *
- * Polls the host half's local feedback endpoint. When the user presses
- * "Send → agent" in the injected toolbar, a NEW feedback entry surfaces as a
- * visible card in `conversation.input.dock` — the strip directly above the
- * chat composer. [Send to agent] hands the formatted feedback to the composer
- * and submits it; [Dismiss] clears the card without sending.
+ * Every session-scoped dock card polls the host half's per-session feedback
+ * endpoint. When the user presses "Send → agent" in the injected toolbar, a
+ * NEW feedback entry surfaces as a visible card in `conversation.input.dock` —
+ * the strip directly above the chat composer. [Add to chat] drops the formatted
+ * feedback into the composer draft (so you can add your own words) without
+ * auto-submitting; [Dismiss] clears the card without sending.
  *
- * The pending card is a single browser-page fact (module-level store shared
- * by every dock mount), updated by the one poller started in `apply`.
+ * Server-side, each session mounts its own agent-browser row, so each session
+ * owns a browser, a dev server, and a per-session feedback port (derived from
+ * the session id). The dock card below polls ITS session's port (via the
+ * `sessionId` the slot framework injects), so feedback never crosses sessions.
  */
-import React, { useState, useSyncExternalStore } from 'react'
+import React, { useEffect, useState } from 'react'
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
-// Type-only: timer helpers (ctx.interval) and the conversation slot map
-// ('conversation.input.dock') augment the context/slot registries.
-import type {} from '@deepseek-ai/cordis-plugin-timer'
+// Type-only: the conversation slot map ('conversation.input.dock') augments
+// the slot registry, and the settings shell declares 'settings.section'.
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { IconCloseOutline16, IconSearchOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
-// Pull the settings slot registry type so 'settings.section' is a valid slot key.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import { LaunchSettingsSection } from './LaunchSettingsSection.tsx'
+import { BASE_PORT, sessionUrl } from './session.ts'
 import css from './FeedbackCard.module.css'
-
-const FEEDBACK_ORIGIN = 'http://127.0.0.1:4600'
-const FEEDBACK_URL = `${FEEDBACK_ORIGIN}/feedback`
 
 interface FeedbackEntry {
   ts: string
@@ -35,23 +34,7 @@ interface FeedbackEntry {
   note: string
 }
 
-export const inject = ['slots', 'timer']
-
-// One pending feedback per browser page (not per session): a module-level
-// store read through useSyncExternalStore so every mounted dock card and the
-// single poller agree on the same value.
-let pending: FeedbackEntry | null = null
-const listeners = new Set<() => void>()
-
-function setPending(next: FeedbackEntry | null): void {
-  pending = next
-  for (const listener of listeners) listener()
-}
-
-function subscribePending(listener: () => void): () => void {
-  listeners.add(listener)
-  return () => { listeners.delete(listener) }
-}
+export const inject = ['slots']
 
 function clean(value: string): string {
   return String(value || '').replace(/\s+/g, ' ').trim()
@@ -91,18 +74,47 @@ function formatFeedback(feedback: FeedbackEntry): string {
   return parts.join('\n')
 }
 
-/** The dock-slot face handed to this card through the session standard kit. */
-interface DockProps {
+/** The slot-injected share this card reads. The session standard kit supplies
+    `sessionId`; the input kit supplies `inputActions`. */
+interface FeedbackCardProps {
+  sessionId: string
   inputActions?: {
     setDraft(text: string): void
     submit(): void
   }
 }
 
-function FeedbackCard({ inputActions }: DockProps) {
-  const feedback = useSyncExternalStore(subscribePending, () => pending)
-  const [sending, setSending] = useState(false)
+function FeedbackCard({ sessionId, inputActions }: FeedbackCardProps) {
+  const [feedback, setFeedback] = useState<FeedbackEntry | null>(null)
   const [thumbFailed, setThumbFailed] = useState(false)
+
+  // Poll this session's feedback endpoint. `lastSeen` lives in the effect
+  // closure so a dismissal of the card (setFeedback(null)) does not re-show
+  // the same entry on the next tick.
+  useEffect(() => {
+    let lastSeen: string | null = null
+    const feedbackUrl = sessionUrl(BASE_PORT, sessionId, '/feedback')
+    const poll = async (): Promise<void> => {
+      try {
+        const response = await fetch(feedbackUrl)
+        if (!response.ok) return
+        const data = (await response.json()) as { feedback?: FeedbackEntry[] }
+        const latest = data.feedback?.[0]
+        if (latest === undefined || latest.ts === undefined) return
+        const key = String(latest.ts)
+        if (lastSeen === null) { lastSeen = key; return }
+        if (key !== lastSeen) {
+          lastSeen = key
+          setFeedback(latest)
+        }
+      } catch {
+        // Host half not up yet — keep polling.
+      }
+    }
+    void poll()
+    const timer = window.setInterval(() => { void poll() }, 1000)
+    return () => window.clearInterval(timer)
+  }, [sessionId])
 
   if (feedback === null) return null
 
@@ -113,11 +125,11 @@ function FeedbackCard({ inputActions }: DockProps) {
       : null
 
   const send = (): void => {
-    if (inputActions === undefined || sending) return
-    setSending(true)
+    if (inputActions === undefined || feedback === null) return
+    // Drop the formatted feedback into the composer as a draft, but do NOT
+    // auto-submit — the user can add their own words and send when ready.
     inputActions.setDraft(formatFeedback(feedback))
-    inputActions.submit()
-    setPending(null)
+    setFeedback(null)
   }
 
   return (
@@ -126,7 +138,7 @@ function FeedbackCard({ inputActions }: DockProps) {
         {feedback.screenshot && !thumbFailed && !feedback.screenshot.startsWith('error:') && (
           <img
             className={css.thumb}
-            src={`${FEEDBACK_ORIGIN}/${feedback.screenshot}`}
+            src={sessionUrl(BASE_PORT, sessionId, `/${feedback.screenshot}`)}
             alt="Browser screenshot"
             loading="lazy"
             onError={() => { setThumbFailed(true) }}
@@ -146,17 +158,17 @@ function FeedbackCard({ inputActions }: DockProps) {
             className={css.dismiss}
             aria-label="Dismiss feedback"
             title="Dismiss"
-            onClick={() => { setPending(null) }}
+            onClick={() => { setFeedback(null) }}
           >
             <IconCloseOutline16 />
           </button>
           <button
             type="button"
             className={css.send}
-            disabled={sending || inputActions === undefined}
+            disabled={inputActions === undefined}
             onClick={send}
           >
-            Send to agent
+            Add to chat
           </button>
         </div>
       </div>
@@ -165,38 +177,10 @@ function FeedbackCard({ inputActions }: DockProps) {
 }
 
 export function apply(ctx: ClientContext): void {
-  let lastSeen: string | null = null
-
-  const poll = async (): Promise<void> => {
-    try {
-      const response = await fetch(FEEDBACK_URL)
-      if (!response.ok) return
-      const data = (await response.json()) as { feedback?: FeedbackEntry[] }
-      const latest = data.feedback?.[0]
-      if (latest === undefined || latest.ts === undefined) return
-      const key = String(latest.ts)
-      // First poll only records the baseline; a card appears for entries
-      // that arrive after this page loaded.
-      if (lastSeen === null) { lastSeen = key; return }
-      if (key !== lastSeen) {
-        lastSeen = key
-        setPending(latest)
-      }
-    } catch {
-      // Host half not up yet — keep polling.
-    }
-  }
-
-  ctx.effect(() => {
-    void poll()
-    const stop = ctx.interval(poll, 1000)
-    return () => { stop() }
-  })
-
   ctx.slots.inject('conversation.input.dock', () =>
     ctx.slots.register(
       { name: 'conversation.input.dock', id: 'agent-browser-bridge', order: 5 },
-      (props: DockProps) => React.createElement(FeedbackCard, props),
+      (props: FeedbackCardProps) => React.createElement(FeedbackCard, props),
     ),
   )
 
@@ -204,7 +188,7 @@ export function apply(ctx: ClientContext): void {
   ctx.slots.inject('settings.section', () =>
     ctx.slots.register(
       { name: 'settings.section', id: 'agent-browser', order: 20, label: () => 'Agent Browser' },
-      (props: { close?: () => void }) => React.createElement(LaunchSettingsSection, props),
+      props => React.createElement(LaunchSettingsSection, props),
     ),
   )
 }

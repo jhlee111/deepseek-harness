@@ -3,8 +3,15 @@
  *
  * Launches a headed Chrome via puppeteer-core, injects the Agent Browser
  * toolbar into every document, exposes agent tools (`browser_launch`,
- * `browser_feedback`, `browser_capture`) and serves a local HTTP feedback
- * endpoint consumed by the client half.
+ * `browser_launch_settings`, `browser_feedback`, `browser_capture`) and serves
+ * a local HTTP feedback endpoint consumed by the client half.
+ *
+ * The row is mounted ONCE under a preset's standing scope, so it holds no
+ * per-session context. All session-scoped state — one browser, one dev-server
+ * child, one launch-settings object, one feedback log — is keyed by the SESSION
+ * ID a tool call or HTTP request identifies. Each session therefore owns an
+ * independent browser (and dev-server port), so multiple sessions in the same
+ * process never collide on launch settings or a feedback port.
  *
  * The row publishes no service (it only consumes `tools`), so it sits loose
  * in a preset safely.
@@ -13,7 +20,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { defineTool, type ToolRunContext } from '@deepseek-ai/dsh-tools'
 import type { JsonValue } from '@deepseek-ai/dsh-session'
 import fs from 'node:fs'
 import http from 'node:http'
@@ -24,6 +31,7 @@ import { connect } from 'node:net'
 import { fileURLToPath } from 'node:url'
 import puppeteer from 'puppeteer-core'
 import type { Browser, Page, Viewport } from 'puppeteer-core'
+import { sessionIdFromRequestUrl, sessionSegment } from './session.ts'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -74,6 +82,36 @@ interface LaunchResult {
   viewport: { width: number; height: number }
 }
 
+interface LaunchSettingsArgs {
+  action?: string
+  defaultUrl?: string
+  viewport?: { width?: number; height?: number }
+  window?: { width?: number; height?: number }
+  devServer?: { command?: string; cwd?: string; port?: number }
+}
+
+interface LaunchSettings {
+  defaultUrl: string
+  viewport: { width: number; height: number }
+  window: { width: number; height: number }
+  devServer: { command: string; cwd: string; port: number }
+}
+
+interface SessionState {
+  sessionId: string
+  browser: Browser | null
+  page: Page | null
+  devChild: ChildProcess | null
+  launchSettings: LaunchSettings
+  feedbackLog: FeedbackEntry[]
+  consoleLog: { type: string; text: string }[]
+  networkLog: { phase: string; method: string; url: string; status?: number; type?: string }[]
+  feedbackDir: string
+  shotsDir: string
+  feedbackFile: string
+  launchSettingsFile: string
+}
+
 function pushLog<T>(arr: T[], entry: T, max = 300): void {
   arr.push(entry)
   if (arr.length > max) arr.shift()
@@ -83,12 +121,10 @@ export function apply(ctx: Context, config: Config = {}): void {
   const chromePath = config.chromePath || process.env.CHROME_PATH || DEFAULT_CHROME
   const port = Number(config.port || process.env.AGENT_BROWSER_PORT || 4600)
   const defaultUrl = config.defaultUrl || process.env.AGENT_BROWSER_URL || 'http://localhost:4000/todos'
-  const feedbackDir = path.resolve(config.feedbackDir || process.env.AGENT_BROWSER_DIR || path.join(__dirname, '..', 'feedback'))
+  const baseFeedbackDir = path.resolve(
+    config.feedbackDir || process.env.AGENT_BROWSER_DIR || path.join(__dirname, '..', 'feedback'),
+  )
   const toolbarPath = path.resolve(config.toolbarPath || path.join(__dirname, '..', 'assets', 'toolbar.js'))
-
-  const shotsDir = path.join(feedbackDir, 'shots')
-  const feedbackFile = path.join(feedbackDir, 'feedback.jsonl')
-  fs.mkdirSync(shotsDir, { recursive: true })
 
   let toolbarSource = ''
   try {
@@ -97,31 +133,22 @@ export function apply(ctx: Context, config: Config = {}): void {
     console.error(`[agent-browser] cannot read toolbar asset: ${toolbarPath}`, e)
   }
 
-  let browser: Browser | null = null
-  let page: Page | null = null
-  const consoleLog: { type: string; text: string }[] = []
-  const networkLog: { phase: string; method: string; url: string; status?: number; type?: string }[] = []
-  const feedbackLog: FeedbackEntry[] = []
+  // ── per-session state (this row is a single instance; sessions key the map) ─
+  const states = new Map<string, SessionState>()
 
-  // ── launch settings (persisted across launches/browser restarts) ─────────
-  interface LaunchSettings {
-    defaultUrl: string
-    viewport: { width: number; height: number }
-    window: { width: number; height: number }
-    devServer: { command: string; cwd: string; port: number }
-  }
-
-  const launchSettingsFile = path.join(feedbackDir, 'launch-settings.json')
-
-  function loadLaunchSettings(): LaunchSettings {
-    const fallback: LaunchSettings = {
+  function defaultLaunchSettings(): LaunchSettings {
+    return {
       defaultUrl,
       viewport: { width: 1280, height: 800 },
       window: { width: 1280, height: 800 },
       devServer: { command: '', cwd: '', port: 0 },
     }
+  }
+
+  function loadLaunchSettings(file: string): LaunchSettings {
+    const fallback = defaultLaunchSettings()
     try {
-      const data = JSON.parse(fs.readFileSync(launchSettingsFile, 'utf8')) as Partial<LaunchSettings>
+      const data = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<LaunchSettings>
       return {
         defaultUrl: typeof data.defaultUrl === 'string' && data.defaultUrl !== ''
           ? data.defaultUrl
@@ -149,11 +176,48 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
   }
 
-  const launchSettings = loadLaunchSettings()
+  function createSessionState(sessionId: string): SessionState {
+    const feedbackDir = path.resolve(baseFeedbackDir, sessionSegment(sessionId))
+    const shotsDir = path.join(feedbackDir, 'shots')
+    const feedbackFile = path.join(feedbackDir, 'feedback.jsonl')
+    const launchSettingsFile = path.join(feedbackDir, 'launch-settings.json')
+    fs.mkdirSync(shotsDir, { recursive: true })
+    return {
+      sessionId,
+      browser: null,
+      page: null,
+      devChild: null,
+      launchSettings: loadLaunchSettings(launchSettingsFile),
+      feedbackLog: [],
+      consoleLog: [],
+      networkLog: [],
+      feedbackDir,
+      shotsDir,
+      feedbackFile,
+      launchSettingsFile,
+    }
+  }
 
-  function saveLaunchSettings(): void {
+  /** Resolve (creating on demand) the state for one session id. */
+  function stateFor(sessionId: string): SessionState {
+    const key = sessionId || '_global'
+    let state = states.get(key)
+    if (state === undefined) {
+      state = createSessionState(key)
+      states.set(key, state)
+    }
+    return state
+  }
+
+  /** The calling session id of one tool execution (empty → the global state). */
+  function sessionIdOf(exec: ToolRunContext): string {
+    const id = exec.agent?.id
+    return typeof id === 'string' ? id : ''
+  }
+
+  function saveLaunchSettings(state: SessionState): void {
     try {
-      fs.writeFileSync(launchSettingsFile, JSON.stringify(launchSettings, null, 2))
+      fs.writeFileSync(state.launchSettingsFile, JSON.stringify(state.launchSettings, null, 2))
     } catch (e) {
       console.error('[agent-browser] launch settings save failed:', e)
     }
@@ -181,14 +245,12 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 
   // ── dev server bootstrapping ─────────────────────────────────────────────
-  let devChild: ChildProcess | null = null
-
-  function waitForPort(port: number, timeoutMs = 30000): Promise<boolean> {
+  function waitForPort(targetPort: number, timeoutMs = 30000): Promise<boolean> {
     return new Promise((resolve) => {
       const deadline = Date.now() + timeoutMs
       const attempt = (): void => {
         if (Date.now() > deadline) { resolve(false); return }
-        const sock = connect({ host: '127.0.0.1', port })
+        const sock = connect({ host: '127.0.0.1', port: targetPort })
         sock.once('connect', () => { sock.destroy(); resolve(true) })
         sock.once('error', () => { sock.destroy(); setTimeout(attempt, 500) })
       }
@@ -197,23 +259,21 @@ export function apply(ctx: Context, config: Config = {}): void {
   }
 
   /**
-   * Start the configured dev server (if any) and wait until its port answers.
-   * Skips when the port is already responding or the child is already tracking.
-   * @returns true when the server is (or is now) reachable.
+   * Start the session's configured dev server (if any) and wait until its port
+   * answers. Skips when the port already responds or the child is tracking.
    */
-  async function ensureDevServer(): Promise<boolean> {
-    const dev = launchSettings.devServer
+  async function ensureDevServer(state: SessionState): Promise<boolean> {
+    const dev = state.launchSettings.devServer
     if (!dev.command || dev.port <= 0) return false
-    // Already answering → assume an external/manual server is running.
     if (await waitForPort(dev.port, 2000)) return true
-    if (devChild !== null) return true
+    if (state.devChild !== null) return true
     try {
-      devChild = spawn('bash', ['-lc', dev.command], {
+      state.devChild = spawn('bash', ['-lc', dev.command], {
         cwd: dev.cwd || process.cwd(),
         env: process.env,
         stdio: 'inherit',
       })
-      devChild.once('exit', () => { devChild = null })
+      state.devChild.once('exit', () => { state.devChild = null })
     } catch (e) {
       console.error('[agent-browser] dev server spawn failed:', e)
       return false
@@ -221,72 +281,76 @@ export function apply(ctx: Context, config: Config = {}): void {
     return waitForPort(dev.port, 30000)
   }
 
-  function appendFeedback(obj: Omit<FeedbackEntry, 'ts'>): FeedbackEntry {
+  function appendFeedback(state: SessionState, obj: Omit<FeedbackEntry, 'ts'>): FeedbackEntry {
     const entry: FeedbackEntry = { ts: new Date().toISOString(), ...obj }
-    feedbackLog.push(entry)
+    state.feedbackLog.push(entry)
     try {
-      fs.appendFileSync(feedbackFile, JSON.stringify(entry) + '\n')
+      fs.appendFileSync(state.feedbackFile, JSON.stringify(entry) + '\n')
     } catch (e) {
       console.error('[agent-browser] feedback append failed:', e)
     }
     return entry
   }
 
-  async function handleBridge(cmd: string, payload: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  async function handleBridge(
+    state: SessionState,
+    cmd: string,
+    payload: Record<string, unknown> = {},
+  ): Promise<Record<string, unknown>> {
     try {
       switch (cmd) {
         case 'ping':
-          return { ok: true, url: page ? page.url() : null, viewport: page ? page.viewport() : null }
+          return { ok: true, url: state.page ? state.page.url() : null, viewport: state.page ? state.page.viewport() : null }
         case 'setViewport': {
-          if (!page) return { ok: false, error: 'browser not launched' }
-          const width = Number(payload.width) || launchSettings.viewport.width
-          const height = Number(payload.height) || launchSettings.viewport.height
-          await page.setViewport({ width, height })
-          await resizeWindow(page, width, height)
-          launchSettings.viewport = { width, height }
-          saveLaunchSettings()
-          return { ok: true, viewport: page.viewport() }
+          if (!state.page) return { ok: false, error: 'browser not launched' }
+          const width = Number(payload.width) || state.launchSettings.viewport.width
+          const height = Number(payload.height) || state.launchSettings.viewport.height
+          await state.page.setViewport({ width, height })
+          await resizeWindow(state.page, width, height)
+          state.launchSettings.viewport = { width, height }
+          saveLaunchSettings(state)
+          return { ok: true, viewport: state.page.viewport() }
         }
         case 'setWindowSize': {
-          if (!page) return { ok: false, error: 'browser not launched' }
-          const width = Number(payload.width) || launchSettings.window.width
-          const height = Number(payload.height) || launchSettings.window.height
-          await resizeWindow(page, width, height)
-          launchSettings.window = { width, height }
-          saveLaunchSettings()
+          if (!state.page) return { ok: false, error: 'browser not launched' }
+          const width = Number(payload.width) || state.launchSettings.window.width
+          const height = Number(payload.height) || state.launchSettings.window.height
+          await resizeWindow(state.page, width, height)
+          state.launchSettings.window = { width, height }
+          saveLaunchSettings(state)
           return { ok: true, window: { width, height } }
         }
         case 'navigate': {
-          if (!page) return { ok: false, error: 'browser not launched' }
+          if (!state.page) return { ok: false, error: 'browser not launched' }
           const url = String(payload.url ?? '')
           if (url === '') return { ok: false, error: 'url is required' }
-          await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 }).catch((e) => {
+          await state.page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 }).catch((e) => {
             console.log('[agent-browser] goto warn:', e)
           })
-          return { ok: true, url: page.url() }
+          return { ok: true, url: state.page.url() }
         }
         case 'evaluate': {
-          if (!page) return { ok: false, error: 'browser not launched' }
+          if (!state.page) return { ok: false, error: 'browser not launched' }
           const code = String(payload.code ?? '')
           if (code === '') return { ok: false, error: 'code is required' }
-          const result = await page.evaluate(src => (0, eval)(src), code)
+          const result = await state.page.evaluate(src => (0, eval)(src), code)
           return { ok: true, result }
         }
         case 'getLaunchSettings':
-          return { ok: true, settings: { ...launchSettings } }
+          return { ok: true, settings: { ...state.launchSettings } }
         case 'setLaunchSettings': {
           if (typeof payload.defaultUrl === 'string' && payload.defaultUrl !== '') {
-            launchSettings.defaultUrl = payload.defaultUrl
+            state.launchSettings.defaultUrl = payload.defaultUrl
           }
           if (payload.viewport && typeof payload.viewport === 'object') {
             const v = payload.viewport as Record<string, unknown>
             const width = Number(v.width)
             const height = Number(v.height)
             if (width > 0 && height > 0) {
-              launchSettings.viewport = { width, height }
-              if (page) {
-                await page.setViewport({ width, height })
-                await resizeWindow(page, width, height)
+              state.launchSettings.viewport = { width, height }
+              if (state.page) {
+                await state.page.setViewport({ width, height })
+                await resizeWindow(state.page, width, height)
               }
             }
           }
@@ -295,39 +359,39 @@ export function apply(ctx: Context, config: Config = {}): void {
             const width = Number(w.width)
             const height = Number(w.height)
             if (width > 0 && height > 0) {
-              launchSettings.window = { width, height }
-              if (page) await resizeWindow(page, width, height)
+              state.launchSettings.window = { width, height }
+              if (state.page) await resizeWindow(state.page, width, height)
             }
           }
           if (payload.devServer && typeof payload.devServer === 'object') {
             const d = payload.devServer as Record<string, unknown>
-            launchSettings.devServer = {
-              command: typeof d.command === 'string' ? d.command : launchSettings.devServer.command,
-              cwd: typeof d.cwd === 'string' ? d.cwd : launchSettings.devServer.cwd,
-              port: Number(d.port) > 0 ? Number(d.port) : launchSettings.devServer.port,
+            state.launchSettings.devServer = {
+              command: typeof d.command === 'string' ? d.command : state.launchSettings.devServer.command,
+              cwd: typeof d.cwd === 'string' ? d.cwd : state.launchSettings.devServer.cwd,
+              port: Number(d.port) > 0 ? Number(d.port) : state.launchSettings.devServer.port,
             }
           }
-          saveLaunchSettings()
-          return { ok: true, settings: { ...launchSettings } }
+          saveLaunchSettings(state)
+          return { ok: true, settings: { ...state.launchSettings } }
         }
         case 'reload':
-          if (!page) return { ok: false, error: 'browser not launched' }
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 })
-          return { ok: true, url: page.url() }
+          if (!state.page) return { ok: false, error: 'browser not launched' }
+          await state.page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 })
+          return { ok: true, url: state.page.url() }
         case 'feedback': {
-          if (!page) return { ok: false, error: 'browser not launched' }
+          if (!state.page) return { ok: false, error: 'browser not launched' }
           let shot: string | null = null
           try {
-            const buf = await page.screenshot({ encoding: 'binary' })
+            const buf = await state.page.screenshot({ encoding: 'binary' })
             const shotName = `shot-${Date.now()}.png`
-            fs.writeFileSync(path.join(shotsDir, shotName), buf)
+            fs.writeFileSync(path.join(state.shotsDir, shotName), buf)
             shot = path.join('shots', shotName)
           } catch (e) {
             shot = 'error:' + (e instanceof Error ? e.message : String(e))
           }
-          const entry = appendFeedback({
-            url: page.url(),
-            viewport: page.viewport(),
+          const entry = appendFeedback(state, {
+            url: state.page.url(),
+            viewport: state.page.viewport(),
             screenshot: shot,
             picked: payload.picked ?? null,
             drawings: Array.isArray(payload.drawings) ? payload.drawings : [],
@@ -343,25 +407,24 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
   }
 
-  async function launchBrowser(url?: string, width?: number, height?: number): Promise<Page> {
-    let targetUrl = url || launchSettings.defaultUrl
-    const viewportWidth = width || launchSettings.viewport.width
-    const viewportHeight = height || launchSettings.viewport.height
-    const windowWidth = launchSettings.window.width
-    const windowHeight = launchSettings.window.height
-    // Auto-start the configured dev server and open its port when no explicit URL was given.
-    const dev = launchSettings.devServer
+  async function launchBrowser(state: SessionState, url?: string, width?: number, height?: number): Promise<Page> {
+    let targetUrl = url || state.launchSettings.defaultUrl
+    const viewportWidth = width || state.launchSettings.viewport.width
+    const viewportHeight = height || state.launchSettings.viewport.height
+    const windowWidth = state.launchSettings.window.width
+    const windowHeight = state.launchSettings.window.height
+    const dev = state.launchSettings.devServer
     if (dev.command && dev.port > 0) {
-      await ensureDevServer()
+      await ensureDevServer(state)
       if (url === undefined || url === '') targetUrl = `http://127.0.0.1:${dev.port}`
     }
-    if (browser && page) {
+    if (state.browser && state.page) {
       if (targetUrl) {
-        await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {})
+        await state.page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch(() => {})
       }
-      return page
+      return state.page
     }
-    browser = await puppeteer.launch({
+    state.browser = await puppeteer.launch({
       headless: false,
       args: [
         '--no-sandbox',
@@ -373,63 +436,67 @@ export function apply(ctx: Context, config: Config = {}): void {
       defaultViewport: null,
       ...(chromePath ? { executablePath: chromePath } : {}),
     })
-    page = await browser.newPage()
-    await page.setViewport({ width: viewportWidth, height: viewportHeight })
-    await page.exposeFunction('__agentBridge', handleBridge)
-    await page.evaluateOnNewDocument(toolbarSource)
+    state.page = await state.browser.newPage()
+    await state.page.setViewport({ width: viewportWidth, height: viewportHeight })
+    await state.page.exposeFunction('__agentBridge', (cmd: string, payload: Record<string, unknown>) =>
+      handleBridge(state, cmd, payload))
+    await state.page.evaluateOnNewDocument(toolbarSource)
     const interesting = new Set(['xhr', 'fetch', 'websocket', 'document', 'script', 'stylesheet'])
-    page.on('console', msg => pushLog(consoleLog, { type: msg.type(), text: msg.text() }))
-    page.on('request', (req) => {
+    state.page.on('console', msg => pushLog(state.consoleLog, { type: msg.type(), text: msg.text() }))
+    state.page.on('request', (req) => {
       if (req.isNavigationRequest() || interesting.has(req.resourceType())) {
-        pushLog(networkLog, { phase: 'request', method: req.method(), url: req.url(), type: req.resourceType() })
+        pushLog(state.networkLog, { phase: 'request', method: req.method(), url: req.url(), type: req.resourceType() })
       }
     })
-    page.on('response', (res) => {
+    state.page.on('response', (res) => {
       const req = res.request()
       if (req.isNavigationRequest() || interesting.has(req.resourceType())) {
-        pushLog(networkLog, { phase: 'response', method: req.method(), url: res.url(), status: res.status(), type: req.resourceType() })
+        pushLog(state.networkLog, { phase: 'response', method: req.method(), url: res.url(), status: res.status(), type: req.resourceType() })
       }
     })
-    await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch((e) => {
+    await state.page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 }).catch((e) => {
       console.log('[agent-browser] goto warn:', e)
     })
-    return page
+    return state.page
   }
 
+  // ── single shared HTTP endpoint, dispatching per session id ───────────────
   const server = http.createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json')
     res.setHeader('Access-Control-Allow-Origin', '*')
+    const sessionId = sessionIdFromRequestUrl(req.url)
+    const state = stateFor(sessionId)
     if (req.method === 'GET' && req.url?.startsWith('/feedback')) {
       res.end(JSON.stringify({
-        feedback: feedbackLog.slice().reverse(),
-        console: consoleLog.slice(),
-        network: networkLog.slice(),
+        feedback: state.feedbackLog.slice().reverse(),
+        console: state.consoleLog.slice(),
+        network: state.networkLog.slice(),
       }, null, 2))
       return
     }
-    if (req.method === 'GET' && req.url === '/launch-settings') {
-      res.end(JSON.stringify({ ok: true, settings: { ...launchSettings } }))
+    if (req.method === 'GET' && req.url?.startsWith('/launch-settings')) {
+      res.end(JSON.stringify({ ok: true, settings: { ...state.launchSettings } }))
       return
     }
-    if (req.method === 'POST' && req.url === '/launch-settings') {
-      const result = await handleBridge('setLaunchSettings', await readJsonBody(req))
+    if (req.method === 'POST' && req.url?.startsWith('/launch-settings')) {
+      const result = await handleBridge(state, 'setLaunchSettings', await readJsonBody(req))
       res.end(JSON.stringify(result))
       return
     }
-    if (req.method === 'POST' && req.url === '/navigate') {
-      const result = await handleBridge('navigate', await readJsonBody(req))
+    if (req.method === 'POST' && req.url?.startsWith('/navigate')) {
+      const result = await handleBridge(state, 'navigate', await readJsonBody(req))
       res.end(JSON.stringify(result))
       return
     }
-    if (req.method === 'POST' && req.url === '/evaluate') {
-      const result = await handleBridge('evaluate', await readJsonBody(req))
+    if (req.method === 'POST' && req.url?.startsWith('/evaluate')) {
+      const result = await handleBridge(state, 'evaluate', await readJsonBody(req))
       res.end(JSON.stringify(result))
       return
     }
     if (req.method === 'GET' && req.url?.startsWith('/shots/')) {
-      // Static thumbnail serving for the web GUI's feedback card.
-      const name = path.basename(decodeURIComponent(req.url.slice('/shots/'.length)))
-      const file = path.join(shotsDir, name)
+      const clean = req.url.slice('/shots/'.length).split('?')[0] ?? ''
+      const name = path.basename(decodeURIComponent(clean))
+      const file = path.join(state.shotsDir, name)
       try {
         const buf = fs.readFileSync(file)
         res.setHeader('Content-Type', 'image/png')
@@ -441,9 +508,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       }
       return
     }
-    if (req.method === 'GET' && req.url === '/capture') {
+    if (req.method === 'GET' && req.url?.startsWith('/capture')) {
       try {
-        const entry = await handleBridge('feedback', { note: 'agent capture' })
+        const entry = await handleBridge(state, 'feedback', { note: 'agent capture' })
         res.end(JSON.stringify(entry))
       } catch (e) {
         res.statusCode = 500
@@ -451,12 +518,12 @@ export function apply(ctx: Context, config: Config = {}): void {
       }
       return
     }
-    if (req.method === 'GET' && req.url === '/health') {
+    if (req.method === 'GET' && req.url?.startsWith('/health')) {
       res.end(JSON.stringify({
         ok: true,
-        launched: page !== null,
-        url: page ? page.url() : null,
-        viewport: page ? page.viewport() : null,
+        launched: state.page !== null,
+        url: state.page ? state.page.url() : null,
+        viewport: state.page ? state.page.viewport() : null,
       }))
       return
     }
@@ -464,7 +531,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     res.end(JSON.stringify({ error: 'not found' }))
   })
   server.listen(port, '127.0.0.1', () => {
-    console.log(`[agent-browser] feedback endpoint: http://127.0.0.1:${port}/feedback`)
+    console.log(`[agent-browser] feedback endpoint: http://127.0.0.1:${port}/feedback?sessionId=<id>`)
   })
 
   ctx.tools.register(defineTool({
@@ -495,13 +562,98 @@ export function apply(ctx: Context, config: Config = {}): void {
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
-    async execute(args: LaunchArgs): Promise<LaunchResult> {
-      const url = args.url || launchSettings.defaultUrl
-      const width = Number(args.width) || launchSettings.viewport.width
-      const height = Number(args.height) || launchSettings.viewport.height
-      const p = await launchBrowser(url, width, height)
+    async execute(args: LaunchArgs, exec: ToolRunContext): Promise<LaunchResult> {
+      const state = stateFor(sessionIdOf(exec))
+      const url = args.url || state.launchSettings.defaultUrl
+      const width = Number(args.width) || state.launchSettings.viewport.width
+      const height = Number(args.height) || state.launchSettings.viewport.height
+      const p = await launchBrowser(state, url, width, height)
       const vp = p.viewport() ?? { width: 0, height: 0 }
       return { ok: true, url: p.url(), viewport: { width: vp.width, height: vp.height } }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'browser_launch_settings',
+    description: 'Read or update THIS session\'s Agent Browser launch settings (default URL, viewport, window size, and the dev server the host auto-starts and opens). Inspect the project first (package.json, mix.exs, vite/next config, config/dev.exs …) to derive the dev server command, working directory, and port, then set them here. Settings are per-session and persist for this session only — another session\'s launch settings are unaffected. Use with browser_launch after setting devServer.',
+    parameters: {
+      action: { type: 'string', description: "'get' (default) returns current settings; 'set' applies the provided fields." },
+      defaultUrl: { type: 'string', description: 'Default URL to open (the dev server URL).' },
+      viewport: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'Browser viewport size.',
+        properties: { width: { type: 'number' }, height: { type: 'number' } },
+      },
+      window: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'OS window size.',
+        properties: { width: { type: 'number' }, height: { type: 'number' } },
+      },
+      devServer: {
+        type: 'object',
+        additionalProperties: false,
+        description: 'Dev server the host runs, waits for, and opens: {command,cwd,port}.',
+        properties: { command: { type: 'string' }, cwd: { type: 'string' }, port: { type: 'number' } },
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          defaultUrl: { type: 'string', required: true },
+          viewport: {
+            type: 'object',
+            additionalProperties: false,
+            required: true,
+            properties: { width: { type: 'number', required: true }, height: { type: 'number', required: true } },
+          },
+          window: {
+            type: 'object',
+            additionalProperties: false,
+            required: true,
+            properties: { width: { type: 'number', required: true }, height: { type: 'number', required: true } },
+          },
+          devServer: {
+            type: 'object',
+            additionalProperties: false,
+            required: true,
+            properties: {
+              command: { type: 'string', required: true },
+              cwd: { type: 'string', required: true },
+              port: { type: 'number', required: true },
+            },
+          },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+    },
+    async execute(args: LaunchSettingsArgs, exec: ToolRunContext): Promise<LaunchSettings> {
+      const state = stateFor(sessionIdOf(exec))
+      if (args.action === 'set') {
+        if (typeof args.defaultUrl === 'string' && args.defaultUrl !== '') {
+          state.launchSettings.defaultUrl = args.defaultUrl
+        }
+        if (args.viewport) {
+          const width = Number(args.viewport.width)
+          const height = Number(args.viewport.height)
+          if (width > 0 && height > 0) state.launchSettings.viewport = { width, height }
+        }
+        if (args.window) {
+          const width = Number(args.window.width)
+          const height = Number(args.window.height)
+          if (width > 0 && height > 0) state.launchSettings.window = { width, height }
+        }
+        if (args.devServer) {
+          if (typeof args.devServer.command === 'string') state.launchSettings.devServer.command = args.devServer.command
+          if (typeof args.devServer.cwd === 'string') state.launchSettings.devServer.cwd = args.devServer.cwd
+          if (Number(args.devServer.port) > 0) state.launchSettings.devServer.port = Number(args.devServer.port)
+        }
+        saveLaunchSettings(state)
+      }
+      return { ...state.launchSettings }
     },
   }))
 
@@ -521,11 +673,12 @@ export function apply(ctx: Context, config: Config = {}): void {
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
-    async execute() {
+    async execute(_args: unknown, exec: ToolRunContext): Promise<{ feedback: JsonValue[]; console: JsonValue[]; network: JsonValue[] }> {
+      const state = stateFor(sessionIdOf(exec))
       return {
-        feedback: feedbackLog.slice().reverse() as unknown as JsonValue[],
-        console: consoleLog.slice() as unknown as JsonValue[],
-        network: networkLog.slice() as unknown as JsonValue[],
+        feedback: state.feedbackLog.slice().reverse() as unknown as JsonValue[],
+        console: state.consoleLog.slice() as unknown as JsonValue[],
+        network: state.networkLog.slice() as unknown as JsonValue[],
       }
     },
   }))
@@ -545,15 +698,18 @@ export function apply(ctx: Context, config: Config = {}): void {
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
-    async execute() {
-      const entry = await handleBridge('feedback', { note: 'agent capture' })
+    async execute(_args: unknown, exec: ToolRunContext): Promise<{ ok: boolean; id: string }> {
+      const state = stateFor(sessionIdOf(exec))
+      const entry = await handleBridge(state, 'feedback', { note: 'agent capture' })
       return { ok: entry.ok === true, id: String(entry.id ?? entry.error ?? '') }
     },
   }))
 
   ctx.effect(() => () => {
     server.close()
-    if (devChild) devChild.kill()
-    if (browser) browser.close().catch(() => {})
+    for (const state of states.values()) {
+      if (state.devChild) state.devChild.kill()
+      if (state.browser) state.browser.close().catch(() => {})
+    }
   })
 }

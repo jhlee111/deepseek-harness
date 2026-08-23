@@ -1,16 +1,22 @@
 /**
  * Agent Browser launch settings section (harness GUI Settings).
  *
- * A self-contained form that reads and writes the agent-browser host's launch
- * settings over its local HTTP endpoint: default launch URL, initial viewport
- * size, and OS window size. No provider/model dependency — it owns its own
- * fetch and local state, so it renders whenever the Settings panel opens.
+ * A self-contained form that reads and writes a session's agent-browser host
+ * launch settings over that session's local HTTP endpoint: default launch URL,
+ * initial viewport size, OS window size, and the dev server. Because launch
+ * info is now scoped per session (one host row per session, per-session port),
+ * this section carries a session selector: pick the session whose launch
+ * settings you want to edit, and the form reads/writes that session's origin.
+ *
+ * No provider/model dependency — it owns its own fetch and local state, so it
+ * renders whenever the Settings panel opens.
  */
 import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
+import type { SessionId, SessionListState } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SnapshotSelectorHook } from '@deepseek-ai/dsh-client-ui-slots'
+import { BASE_PORT, sessionUrl } from './session.ts'
 import css from './LaunchSettingsSection.module.css'
-
-const HOST_ORIGIN = 'http://127.0.0.1:4600'
 
 interface LaunchSettings {
   defaultUrl: string
@@ -19,9 +25,10 @@ interface LaunchSettings {
   devServer: { command: string; cwd: string; port: number }
 }
 
+/** Props the settings slot supplies: the global standard kit plus the close handle. */
 export interface LaunchSettingsSectionProps {
-  /** Close the settings panel (owner share); optional for this section. */
   close?: () => void
+  useSessions: SnapshotSelectorHook<SessionListState>
 }
 
 function Field(props: { label: string; children: ReactNode }) {
@@ -33,15 +40,41 @@ function Field(props: { label: string; children: ReactNode }) {
   )
 }
 
-export function LaunchSettingsSection(_props: LaunchSettingsSectionProps) {
+function sessionLabel(id: SessionId, sessions: SessionListState): string {
+  const row = sessions.byId[id]
+  const title = row?.title?.trim()
+  const cwd = row?.cwd
+  return [title, cwd].filter(Boolean).join(' — ') || id
+}
+
+export function LaunchSettingsSection({ useSessions }: LaunchSettingsSectionProps) {
+  const sessions = useSessions(s => s)
+  const [selectedId, setSelectedId] = useState<SessionId | undefined>(sessions.current ?? sessions.ids[0])
   const [settings, setSettings] = useState<LaunchSettings | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
 
+  // Steer the selection to the current/first session once the list is ready,
+  // and recover when the selected session leaves the list.
   useEffect(() => {
+    if (selectedId === undefined || !sessions.ids.some(id => id === selectedId)) {
+      const next = sessions.current ?? sessions.ids[0]
+      if (next !== undefined) setSelectedId(next)
+    }
+  }, [sessions, selectedId])
+
+  useEffect(() => {
+    if (selectedId === undefined) {
+      setSettings(null)
+      setLoading(false)
+      return
+    }
     let alive = true
-    fetch(`${HOST_ORIGIN}/launch-settings`)
+    setLoading(true)
+    setMessage(null)
+    const launchUrl = sessionUrl(BASE_PORT, selectedId, '/launch-settings')
+    fetch(launchUrl)
       .then(response => response.json())
       .then((data) => {
         if (!alive) return
@@ -50,18 +83,20 @@ export function LaunchSettingsSection(_props: LaunchSettingsSectionProps) {
         } else {
           setMessage('Launch settings unavailable')
         }
-        setLoading(false)
       })
       .catch(() => {
         if (!alive) return
         setMessage('agent-browser host not reachable')
-        setLoading(false)
       })
+      .finally(() => { if (alive) setLoading(false) })
     return () => { alive = false }
-  }, [])
+  }, [selectedId])
 
+  if (selectedId === undefined) return <p className={css.state}>No session to edit.</p>
   if (loading) return <p className={css.state}>Loading launch settings…</p>
   if (settings === null) return <p className={css.state}>{message ?? 'Launch settings unavailable'}</p>
+
+  const launchUrl = sessionUrl(BASE_PORT, selectedId, '/launch-settings')
 
   const update = (patch: Partial<LaunchSettings>): void => {
     setSettings(current => (current === null ? current : { ...current, ...patch }))
@@ -81,7 +116,7 @@ export function LaunchSettingsSection(_props: LaunchSettingsSectionProps) {
     setSaving(true)
     setMessage(null)
     try {
-      const response = await fetch(`${HOST_ORIGIN}/launch-settings`, {
+      const response = await fetch(launchUrl, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(settings),
@@ -96,6 +131,17 @@ export function LaunchSettingsSection(_props: LaunchSettingsSectionProps) {
 
   return (
     <div className={css.panel}>
+      <Field label="Session">
+        <select
+          className={css.input}
+          value={selectedId}
+          onChange={(event) => { setSelectedId(event.currentTarget.value as SessionId) }}
+        >
+          {sessions.ids.map(id => (
+            <option key={id} value={id}>{sessionLabel(id, sessions)}</option>
+          ))}
+        </select>
+      </Field>
       <Field label="Default URL">
         <input
           className={css.input}
@@ -173,9 +219,9 @@ export function LaunchSettingsSection(_props: LaunchSettingsSectionProps) {
         {message !== null && <span className={css.message}>{message}</span>}
       </div>
       <p className={css.hint}>
-        Applies on the next browser launch. The dev server command runs in the working directory
-        (environment injected by the command, e.g. envrun) and the browser waits for the port
-        before opening.
+        Applies to the selected session on its next browser launch. The dev server command
+        runs in the working directory (environment injected by the command, e.g. envrun)
+        and the browser waits for the port before opening.
       </p>
     </div>
   )
