@@ -1,0 +1,6 @@
+# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
+# side as of the last confirmed-consistent state. Both languages carry equal authority;
+# after editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-08-22-elixir-otp-harness-poc.md
+2026-08-22-elixir-otp-harness-poc.md: ccb639877f45db68ab513dddc81e0644bddc324f
+2026-08-22-elixir-otp-harness-poc.zh.md: a93c72327fe381a25a049247f9107feb249effd2
