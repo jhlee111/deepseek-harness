@@ -32,6 +32,7 @@ interface FeedbackEntry {
   picked: Record<string, unknown> | null
   drawings: unknown[]
   note: string
+  source?: string
 }
 
 export const inject = ['slots']
@@ -99,7 +100,10 @@ function FeedbackCard({ sessionId, inputActions }: FeedbackCardProps) {
         const response = await fetch(feedbackUrl)
         if (!response.ok) return
         const data = (await response.json()) as { feedback?: FeedbackEntry[] }
-        const latest = data.feedback?.[0]
+        // Show only user-initiated toolbar feedback. Agent-initiated captures
+        // go straight into the agent's context (browser_capture tool result),
+        // so they must not surface a waiting card here.
+        const latest = data.feedback?.find(entry => entry.source !== 'agent')
         if (latest === undefined || latest.ts === undefined) return
         const key = String(latest.ts)
         if (lastSeen === null) { lastSeen = key; return }

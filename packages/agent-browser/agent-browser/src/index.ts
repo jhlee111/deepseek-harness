@@ -68,6 +68,8 @@ interface FeedbackEntry {
   picked: unknown
   drawings: unknown[]
   note: string
+  /** 'toolbar' = user-initiated (surfaces a card); 'agent' = tool-driven (agent context, no card). */
+  source: 'toolbar' | 'agent'
 }
 
 interface LaunchArgs {
@@ -381,10 +383,12 @@ export function apply(ctx: Context, config: Config = {}): void {
         case 'feedback': {
           if (!state.page) return { ok: false, error: 'browser not launched' }
           let shot: string | null = null
+          let shotFile: string | null = null
           try {
             const buf = await state.page.screenshot({ encoding: 'binary' })
             const shotName = `shot-${Date.now()}.png`
-            fs.writeFileSync(path.join(state.shotsDir, shotName), buf)
+            shotFile = path.join(state.shotsDir, shotName)
+            fs.writeFileSync(shotFile, buf)
             shot = path.join('shots', shotName)
           } catch (e) {
             shot = 'error:' + (e instanceof Error ? e.message : String(e))
@@ -396,8 +400,9 @@ export function apply(ctx: Context, config: Config = {}): void {
             picked: payload.picked ?? null,
             drawings: Array.isArray(payload.drawings) ? payload.drawings : [],
             note: String(payload.note ?? ''),
+            source: payload.source === 'agent' ? 'agent' : 'toolbar',
           })
-          return { ok: true, id: entry.ts }
+          return { ok: true, id: entry.ts, ...entry, screenshotFile: shotFile }
         }
         default:
           return { ok: false, error: 'unknown command: ' + cmd }
@@ -510,7 +515,7 @@ export function apply(ctx: Context, config: Config = {}): void {
     }
     if (req.method === 'GET' && req.url?.startsWith('/capture')) {
       try {
-        const entry = await handleBridge(state, 'feedback', { note: 'agent capture' })
+        const entry = await handleBridge(state, 'feedback', { note: 'agent capture', source: 'agent' })
         res.end(JSON.stringify(entry))
       } catch (e) {
         res.statusCode = 500
@@ -685,7 +690,7 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   ctx.tools.register(defineTool({
     name: 'browser_capture',
-    description: 'Capture the current browser state as a feedback entry (screenshot + picked element + drawings).',
+    description: 'Capture the current browser state (screenshot, url, viewport, picked element, drawings) and return it to the agent context. The capture is recorded but does not surface a user card — use browser_feedback to read the log if needed.',
     parameters: {},
     output: {
       schema: {
@@ -694,14 +699,47 @@ export function apply(ctx: Context, config: Config = {}): void {
         properties: {
           ok: { type: 'boolean', required: true },
           id: { type: 'string', required: true },
+          url: { type: 'string', required: true },
+          viewport: {
+            type: 'object',
+            additionalProperties: false,
+            required: true,
+            properties: { width: { type: 'number', required: true }, height: { type: 'number', required: true } },
+          },
+          screenshot: { type: 'string', required: true },
+          screenshotFile: { type: 'string', required: true },
+          picked: { type: 'json', required: true },
+          drawings: { type: 'array', required: true },
+          note: { type: 'string', required: true },
         },
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
-    async execute(_args: unknown, exec: ToolRunContext): Promise<{ ok: boolean; id: string }> {
+    async execute(_args: unknown, exec: ToolRunContext): Promise<{
+      ok: boolean
+      id: string
+      url: string
+      viewport: { width: number; height: number }
+      screenshot: string
+      screenshotFile: string
+      picked: JsonValue
+      drawings: JsonValue[]
+      note: string
+    }> {
       const state = stateFor(sessionIdOf(exec))
-      const entry = await handleBridge(state, 'feedback', { note: 'agent capture' })
-      return { ok: entry.ok === true, id: String(entry.id ?? entry.error ?? '') }
+      const entry = await handleBridge(state, 'feedback', { note: 'agent capture', source: 'agent' })
+      const vp = entry.viewport as { width?: number; height?: number } | null
+      return {
+        ok: entry.ok === true,
+        id: String(entry.id ?? entry.error ?? ''),
+        url: String(entry.url ?? ''),
+        viewport: { width: Number(vp?.width) || 0, height: Number(vp?.height) || 0 },
+        screenshot: String(entry.screenshot ?? ''),
+        screenshotFile: String(entry.screenshotFile ?? ''),
+        picked: (entry.picked as JsonValue | null) ?? null,
+        drawings: Array.isArray(entry.drawings) ? entry.drawings as JsonValue[] : [],
+        note: String(entry.note ?? ''),
+      }
     },
   }))
 
