@@ -348,7 +348,15 @@
 
     window.addEventListener('resize', function () { updateDims(); clampPos() })
     positionInitial()
-    updateDims()
+
+    // Make the default Responsive mode actually follow the window from load —
+    // even when the page was launched with a fixed viewport. Fires the same
+    // bridge the dropdown would, so the initial value and reality agree.
+    if (presets.value === 'responsive' && window.__agentBridge) {
+      window.__agentBridge('setViewport', { responsive: true }).then(function () { updateDims() })
+    } else {
+      updateDims()
+    }
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init)
